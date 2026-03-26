@@ -1,0 +1,583 @@
+---
+title: "Prediction Model for Progression-Free Survival in Breast Cancer Patients"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+```
+
+# Setup
+
+```{r packages}
+
+library(tidyverse)   
+library(caret)       
+library(glmnet)      
+library(mgcv)        # GAM
+library(earth)       # MARS
+library(corrplot)    
+library(knitr)       
+library(kableExtra)  
+library(vip)         # variable importance
+library(car)         
+
+```
+
+```{r seed-and-cv}
+
+set.seed(1)
+
+ctrl <- trainControl(
+  method    = "repeatedcv",
+  number    = 10,       # 10-fold
+  repeats   = 5,        # 5 times
+  savePredictions = TRUE
+)
+```
+
+---
+
+# Part I: Prediction Model for datA (1990–1995)
+
+## Data Loading & Preprocessing
+
+```{r load-data}
+
+load("datA.RData")   
+
+str(datA)
+
+```
+
+```{r preprocessing}
+
+datA <- datA |>
+  mutate(
+    menopause       = factor(menopause, levels = c(0, 1),
+                             labels = c("Pre", "Post")),
+    race            = factor(race, levels = c(1, 2, 3, 4),
+                             labels = c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade     = factor(tumor_grade, levels = c(1, 2, 3),
+                             labels = c("Well", "Moderate", "Poor")),
+    stage           = factor(stage, levels = c(1, 2, 3),
+                             labels = c("I", "II", "III")),
+    ER              = factor(ER,  levels = c(0, 1), labels = c("Neg", "Pos")),
+    PR              = factor(PR,  levels = c(0, 1), labels = c("Neg", "Pos")),
+    HER2            = factor(HER2, levels = c(0, 1), labels = c("Neg", "Pos")),
+    surgery         = factor(surgery, levels = c(0, 1),
+                             labels = c("BCS", "Mastectomy")),
+    chemo           = factor(chemo, levels = c(0, 1), labels = c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, levels = c(0, 1),
+                              labels = c("No", "Yes"))
+  ) |>
+  select(-any_of("id"))   # remove patient ID
+
+# Reference levels: White, Grade Well, Stage I, Neg, BCS, No chemo, No hormonal
+# (these are already the first levels set above)
+
+dim(datA)
+
+```
+
+---
+
+## Exploratory Data Analysis
+
+```{r eda-setup}
+cont_vars <- c("age", "bmi", "tumor_size", "lymph_nodes", "Ki67", "log_PFS")
+cat_vars  <- c("menopause", "race", "tumor_grade", "stage",
+               "ER", "PR", "HER2", "surgery", "chemo", "hormonal_therapy")
+```
+
+### Outcome Distribution
+
+```{r outcome-dist, fig.cap="Figure A1. Distribution of log(PFS) and normal Q-Q plot (datA)."}
+
+p1 <- ggplot(datA, aes(x = log_PFS)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40,
+                 fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_density(color = "darkred", linewidth = 0.8) +
+  labs(x = "log(PFS) (months)", y = "Density") +
+  theme_bw()
+
+p2 <- ggplot(datA, aes(sample = log_PFS)) +
+  stat_qq() + stat_qq_line(color = "darkred") +
+  
+  labs(x = "Theoretical", y = "Sample") +
+  theme_bw()
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+
+```
+
+### Summary Statistics
+
+```{r summary-continuous}
+datA |>
+  select(all_of(cont_vars)) |>
+  summarise(across(everything(), list(
+    Mean   = \(x) round(mean(x), 2),
+    SD     = \(x) round(sd(x), 2),
+    Median = \(x) round(median(x), 2),
+    Min    = \(x) round(min(x), 2),
+    Max    = \(x) round(max(x), 2)
+  ))) |>
+  pivot_longer(everything(), names_to = c("Variable", "Stat"), names_sep = "_(?=[^_]+$)") |>
+  pivot_wider(names_from = Stat, values_from = value) |>
+  kable(caption = "Table 1. Summary statistics of continuous variables (datA).") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+
+```
+
+```{r summary-categorical}
+
+datA |>
+  select(all_of(cat_vars)) |>
+  pivot_longer(everything(), names_to = "Variable", values_to = "Level") |>
+  count(Variable, Level) |>
+  group_by(Variable) |>
+  mutate(`n (%)` = paste0(n, " (", round(100 * n / sum(n), 1), "%)")) |>
+  select(-n) |>
+  kable(caption = "Table 2. Frequency distribution of categorical variables (datA).") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+
+```
+
+### Correlation Among Continuous Predictors
+
+```{r corr-plot, fig.cap="Figure A2. Correlation matrix of continuous predictors (datA)."}
+
+datA |>
+  select(all_of(cont_vars)) |>
+  cor() |>
+  corrplot(method = "color", type = "upper",
+           addCoef.col = "black", number.cex = 0.7, tl.cex = 0.8,
+           mar = c(0, 0, 1, 0))
+
+```
+
+### Outcome by Predictors
+
+```{r outcome-by-clinical}
+
+p_stage <- ggplot(datA, aes(x = stage, y = log_PFS, fill = stage)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  labs(x = "Stage", y = "log(PFS)", title = "By Stage") + theme_bw()
+
+p_grade <- ggplot(datA, aes(x = tumor_grade, y = log_PFS, fill = tumor_grade)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  labs(x = "Tumor Grade", y = "log(PFS)", title = "By Tumor Grade") + theme_bw()
+
+p_er <- ggplot(datA, aes(x = ER, y = log_PFS, fill = ER)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  labs(x = "ER Status", y = "log(PFS)", title = "By ER Status") + theme_bw()
+
+p_her2 <- ggplot(datA, aes(x = HER2, y = log_PFS, fill = HER2)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  labs(x = "HER2 Status", y = "log(PFS)", title = "By HER2 Status") + theme_bw()
+
+gridExtra::grid.arrange(p_stage, p_grade, p_er, p_her2, ncol = 2)
+
+```
+
+```{r scatter-continuous}
+
+datA |>
+  select(log_PFS, age, bmi, tumor_size, lymph_nodes, Ki67) |>
+  pivot_longer(-log_PFS, names_to = "Predictor", values_to = "Value") |>
+  ggplot(aes(x = Value, y = log_PFS)) +
+  geom_point(alpha = 0.15, size = 0.8, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", se = TRUE, linewidth = 0.8) +
+  facet_wrap(~Predictor, scales = "free_x", ncol = 3) +
+  labs(x = NULL, y = "log(PFS)") +
+  theme_bw()
+
+```
+
+### Summary
+
+The outcome `log_PFS` is approximately normally distributed,
+supporting the use of linear regression-based models.
+
+Among continuous predictors, `lymph_nodes` (r = −0.32), `tumor_size` (r = −0.29), and `Ki67` (r = −0.25) show the strongest marginal associations with `log_PFS`, while `age`
+and `bmi` show near-zero linear correlation. Critically, `tumor_size` and `lymph_nodes`are strongly collinear (r = 0.71), which inflates variance in OLS and motivates the use of **Elastic Net** regularization to stabilize coefficient estimates.
+
+The LOESS plots reveal that `lymph_nodes` and `Ki67` exhibit non-linear relationships with
+`log_PFS` — the effect of `lymph_nodes` appears to level off at higher values, and `Ki67`
+shows a curved trend. This motivates **GAM** and **MARS** as non-linear alternatives.
+`age` and `bmi` show relatively flat LOESS curves, suggesting their effects may be
+conditional on other factors (e.g., menopausal status) rather than independently non-linear.
+
+Together, these findings support training four candidate models: OLS (baseline), Elastic Net
+(collinearity), GAM (non-linearity), and MARS (non-linearity + interactions).
+
+---
+
+## Model Training
+
+### Model 1: OLS Linear Regression
+
+```{r ols}
+
+set.seed(1)
+fit_ols <- train(
+  log_PFS ~ .,
+  data      = datA,
+  method    = "lm",
+  trControl = ctrl,
+  preProcess = c("center", "scale")
+)
+
+summary(fit_ols$finalModel)
+
+```
+
+### Model 2: Elastic Net
+
+```{r elastic-net}
+set.seed(1)
+enet_grid <- expand.grid(
+  alpha  = seq(0, 1, by = 0.1),
+  lambda = exp(seq(log(0.001), log(1), length.out = 50))
+)
+
+fit_enet <- train(
+  log_PFS ~ .,
+  data       = datA,
+  method     = "glmnet",
+  trControl  = ctrl,
+  tuneGrid   = enet_grid,
+  preProcess = c("center", "scale")
+)
+
+# Best tuning parameters
+fit_enet$bestTune
+
+# Plot CV-RMSE vs log(lambda), one line per alpha
+fit_enet$results |>
+  filter(!is.na(RMSE)) |>
+  ggplot(aes(x = log(lambda), y = RMSE, color = factor(alpha), group = factor(alpha))) +
+  geom_line() +
+  labs(x = "log(lambda)", y = "CV-RMSE", color = "alpha",
+       title = "Elastic Net: CV-RMSE by alpha and lambda") +
+  theme_bw()
+
+```
+
+### Model 3: GAM
+
+```{r gam}
+
+set.seed(1)
+
+# Final GAM on full datA
+fit_gam <- mgcv::gam(
+  log_PFS ~ s(age) + s(bmi) + s(tumor_size) + s(lymph_nodes) + s(Ki67) +
+    menopause + race + tumor_grade + stage +
+    ER + PR + HER2 + surgery + chemo + hormonal_therapy,
+  data   = datA,
+  method = "REML"
+)
+
+summary(fit_gam)
+
+folds <- createFolds(datA$log_PFS, k = 10, list = TRUE, returnTrain = FALSE)
+
+gam_preds <- numeric(nrow(datA))
+for (i in seq_along(folds)) {
+  train_i <- datA[-folds[[i]], ]
+  test_i  <- datA[ folds[[i]], ]
+  gam_i   <- mgcv::gam(
+    log_PFS ~ s(age) + s(bmi) + s(tumor_size) + s(lymph_nodes) + s(Ki67) +
+      menopause + race + tumor_grade + stage +
+      ER + PR + HER2 + surgery + chemo + hormonal_therapy,
+    data = train_i, method = "REML"
+  )
+  gam_preds[folds[[i]]] <- predict(gam_i, newdata = test_i)
+}
+
+gam_cv_rmse <- sqrt(mean((datA$log_PFS - gam_preds)^2))
+gam_cv_r2   <- cor(datA$log_PFS, gam_preds)^2
+cat("GAM 10-fold CV RMSE:", round(gam_cv_rmse, 4),
+    " R2:", round(gam_cv_r2, 4), "\n")
+
+```
+
+### Model 4: MARS
+
+```{r mars}
+
+set.seed(1)
+mars_grid <- expand.grid(
+  degree = 1:2,
+  nprune = 2:20
+)
+
+fit_mars <- train(
+  log_PFS ~ .,
+  data      = datA,
+  method    = "earth",
+  trControl = ctrl,
+  tuneGrid  = mars_grid,
+  preProcess = c("center", "scale")
+)
+
+fit_mars$bestTune
+plot(fit_mars)
+
+# Variable importance
+vip::vip(fit_mars, num_features = 15)
+
+```
+
+---
+
+## Model Comparison & Selection
+
+```{r model-comparison}
+
+# caret models compared via resamples()
+resamples_list <- resamples(list(
+  OLS        = fit_ols,
+  ElasticNet = fit_enet,
+  MARS       = fit_mars
+))
+
+cv_stats <- summary(resamples_list)$statistics
+
+caret_rmse <- cv_stats$RMSE[, "Mean"]
+caret_r2   <- cv_stats$Rsquared[, "Mean"]
+
+# Add GAM 
+all_cv <- data.frame(
+  Model   = c(names(caret_rmse), "GAM"),
+  CV_RMSE = round(c(caret_rmse, gam_cv_rmse), 4),
+  CV_R2   = round(c(caret_r2,   gam_cv_r2),   4)
+) |> arrange(CV_RMSE)
+
+all_cv |>
+  kable(caption = "Table 3. Cross-validated RMSE and R-squared for four candidate models (datA).",
+        col.names = c("Model", "CV-RMSE", "CV-R2")) |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+
+```
+
+
+### Final Model Selection
+
+**Selected model: GAM**
+
+```{r final-model-selection}
+
+# GAM as final model
+cat("Final model: GAM\n")
+cat("CV-RMSE: ", round(gam_cv_rmse, 4), "\n")
+cat("CV-R2:   ", round(gam_cv_r2,   4), "\n")
+
+```
+
+**Rationale.** Four candidate models were trained and compared using 10-fold
+cross-validated RMSE (repeated 5 times): OLS (baseline), Elastic Net, MARS, and GAM.
+All four models performed similarly (CV-RMSE range: 0.6975–0.7035), reflecting
+the inherent predictive ceiling of 16 baseline clinical variables for individual-level
+PFS prediction.
+
+GAM was selected as the final model for the following reasons:
+
+- **Best predictive performance**: GAM achieved the lowest CV-RMSE
+- **Empirically justified non-linearity**: EDA identified non-linear LOESS patterns for
+`bmi`, `tumor_size`, and `lymph_nodes`, validating the use of smooth terms over a purely linear specification.
+- **Interactions not supported by data**: MARS with degree = 2 searched the full predictor
+space for useful two-way interactions and selected degree = 1, indicating no interaction term
+improved out-of-sample performance, supports an additive model structure.
+
+The modest overall R-square (0.21) is consistent with clinical-only prediction models for
+PFS in the literature and reflects unmeasured biological factors (e.g., genomic profiles)
+rather than model misspecification.
+
+---
+
+## Final Model: Results & Interpretation
+
+### Model Coefficients (Parametric Terms)
+
+```{r gam-coef-table}
+# Extract parametric coefficients from GAM
+gam_coef <- summary(fit_gam)$p.table |>
+  as.data.frame() |>
+  rownames_to_column("Term") |>
+  mutate(across(where(is.numeric), \(x) round(x, 4))) |>
+  rename(SE = `Std. Error`, `t-value` = `t value`, `p-value` = `Pr(>|t|)`)
+
+gam_coef |>
+  kable(caption = "Table 3a. GAM parametric coefficient estimates (datA).") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+```
+
+```{r gam-smooth-table}
+# Smooth terms significance
+gam_smooth <- summary(fit_gam)$s.table |>
+  as.data.frame() |>
+  rownames_to_column("Smooth Term") |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+
+gam_smooth |>
+  kable(caption = "Table 3b. GAM smooth term significance (datA). edf > 1 indicates non-linearity.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+```
+
+The following interpretation uses reference levels: White, pre-menopausal, Grade Well,
+Stage I, ER/PR/HER2-negative, BCS, no chemotherapy, no hormonal therapy.
+
+**Demographic characteristics:** Age showed a small but significant negative smooth effect
+on log-PFS (p = 0.03), with older patients having slightly shorter PFS. BMI exhibited the
+strongest non-linearity, suggesting a non-monotonic relationship with
+PFS. Menopausal status and race were not significant after adjusting for other factors.
+
+**Tumor characteristics:** Higher lymph node count was the strongest predictor of shorter
+PFS (p < 0.001). Larger tumor size was associated with worse PFS (p = 0.006).
+HER2-positive status was associated with 0.174 lower log-PFS compared to HER2-negative
+(p < 0.001), reflecting its aggressive phenotype in this pre-trastuzumab era cohort.
+ER-positive status was associated with 0.234 higher log-PFS (p < 0.001), consistent with
+the favorable prognosis of hormone receptor-positive tumors. Poorly differentiated tumors
+(Grade Poor) had significantly shorter PFS than well-differentiated tumors (est. = −0.162,
+p = 0.006). PR, Ki67, and stage were not significant after adjustment.
+
+**Treatment characteristics:** Hormonal therapy was the only treatment variable
+significantly associated with PFS (est. = +0.133, p < 0.001), consistent with its
+established efficacy for ER-positive disease. Surgery type and chemotherapy receipt were
+not significant after adjusting for tumor and receptor characteristics.
+
+### Partial Effect Plots (Smooth Terms)
+
+```{r gam-partial-effects, fig.cap="Figure A5. Partial effects of continuous predictors in the final GAM (datA). Shaded bands are 95% credible intervals; rug marks show data density."}
+par(mfrow = c(2, 3), mar = c(4, 4, 2, 1))
+plot(fit_gam, shade = TRUE, shade.col = "lightblue",
+     seWithMean = TRUE, scale = 0)
+par(mfrow = c(1, 1))
+```
+
+### Performance Assessment
+
+```{r gam-performance}
+# Training RMSE and R2
+train_pred  <- predict(fit_gam)
+train_rmse  <- sqrt(mean((datA$log_PFS - train_pred)^2))
+train_r2    <- summary(fit_gam)$r.sq
+
+data.frame(
+  Metric  = c("Training RMSE", "CV-RMSE (10-fold)", "Training R2 (adj)", "CV-R2"),
+  Value   = round(c(train_rmse, gam_cv_rmse, train_r2, gam_cv_r2), 4)
+) |>
+  kable(caption = "Table 3c. GAM performance metrics (datA).") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 10)
+```
+
+
+
+---
+
+# Part II: Generalizability to datB (2000–2005)
+
+## Cohort Comparison: datA vs datB
+
+```{r load-datB}
+load("datB.RData")
+
+datB <- datB |>
+  mutate(
+    menopause        = factor(menopause, levels = c(0, 1), labels = c("Pre", "Post")),
+    race             = factor(race, levels = c(1, 2, 3, 4),
+                              labels = c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade      = factor(tumor_grade, levels = c(1, 2, 3),
+                              labels = c("Well", "Moderate", "Poor")),
+    stage            = factor(stage, levels = c(1, 2, 3), labels = c("I", "II", "III")),
+    ER               = factor(ER,  levels = c(0, 1), labels = c("Neg", "Pos")),
+    PR               = factor(PR,  levels = c(0, 1), labels = c("Neg", "Pos")),
+    HER2             = factor(HER2, levels = c(0, 1), labels = c("Neg", "Pos")),
+    surgery          = factor(surgery, levels = c(0, 1), labels = c("BCS", "Mastectomy")),
+    chemo            = factor(chemo, levels = c(0, 1), labels = c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, levels = c(0, 1), labels = c("No", "Yes"))
+  ) |>
+  select(-any_of("id"))
+```
+
+```{r cohort-comparison}
+# Outcome comparison
+rbind(
+  datA |> summarise(Cohort="datA (1990-95)", Mean=round(mean(log_PFS),3),
+                    SD=round(sd(log_PFS),3), Median=round(median(log_PFS),3)),
+  datB |> summarise(Cohort="datB (2000-05)", Mean=round(mean(log_PFS),3),
+                    SD=round(sd(log_PFS),3), Median=round(median(log_PFS),3))
+) |>
+  kable(caption = "Table 4. Comparison of log(PFS) between cohorts.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+
+# t-test on outcome
+t.test(datA$log_PFS, datB$log_PFS)
+```
+
+```{r continuous-comparison}
+# Continuous predictor comparison
+cont_pred <- c("age", "bmi", "tumor_size", "lymph_nodes", "Ki67")
+
+map_dfr(cont_pred, function(v) {
+  tibble(
+    Variable = v,
+    `datA mean (SD)` = paste0(round(mean(datA[[v]]), 2),
+                               " (", round(sd(datA[[v]]), 2), ")"),
+    `datB mean (SD)` = paste0(round(mean(datB[[v]]), 2),
+                               " (", round(sd(datB[[v]]), 2), ")"),
+    `Diff (B-A)`     = round(mean(datB[[v]]) - mean(datA[[v]]), 2),
+    `p-value`        = round(t.test(datA[[v]], datB[[v]])$p.value, 4)
+  )
+}) |>
+  kable(caption = "Table 5. Continuous predictor comparison between cohorts.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+```
+
+```{r treatment-comparison}
+# Treatment and key categorical comparison
+treat_vars <- c("stage", "chemo", "hormonal_therapy", "surgery")
+
+map_dfr(treat_vars, function(v) {
+  pA <- round(100 * prop.table(table(datA[[v]])), 1)
+  pB <- round(100 * prop.table(table(datB[[v]])), 1)
+  tibble(
+    Variable = v,
+    `datA (%)` = paste(names(pA), pA, sep = "=", collapse = ", "),
+    `datB (%)` = paste(names(pB), pB, sep = "=", collapse = ", ")
+  )
+}) |>
+  kable(caption = "Table 6. Treatment and stage distribution between cohorts.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), font_size = 10)
+```
+
+```{r outcome-dist-comparison, fig.cap="Figure A6. Distribution of log(PFS) in datA vs datB."}
+bind_rows(
+  datA |> select(log_PFS) |> mutate(Cohort = "datA (1990-95)"),
+  datB |> select(log_PFS) |> mutate(Cohort = "datB (2000-05)")
+) |>
+  ggplot(aes(x = log_PFS, fill = Cohort)) +
+  geom_density(alpha = 0.5) +
+  geom_vline(xintercept = c(mean(datA$log_PFS), mean(datB$log_PFS)),
+             linetype = "dashed", color = c("steelblue", "coral")) +
+  labs(x = "log(PFS) (months)", y = "Density") +
+  theme_bw()
+```
+
+
