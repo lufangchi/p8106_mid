@@ -1,0 +1,218 @@
+---
+title: "Model Validation"
+author: "Meitong Zhou"
+date: "2026-03-27"
+output: html_document
+---
+
+Method：
+
+To assess the generalizability of the final prediction model developed in the 1990–1995 cohort (datA), we conducted an external validation using an independent cohort of 2000 breast cancer patients diagnosed between 2000 and 2005 (datB). To ensure methodological consistency with Part I, datB underwent the same preprocessing and variable coding as datA, including identical definitions for clinicopathological factors such as menopause, race, tumor grade, stage, receptor status (ER, PR, HER2), and treatment variables including surgery, chemotherapy, and hormonal therapy. The final model selected in Part I was a generalized additive model (GAM), which was reconstructed on datA using smooth terms for continuous predictors (age, BMI, tumor size, lymph nodes, and Ki67) and linear terms for categorical predictors. The fitted model was then directly applied to datB to generate predicted log(PFS) values.
+
+External validation performance in datB was evaluated using root mean squared error (RMSE), mean absolute error (MAE), coefficient of determination (R²), and mean prediction bias. These metrics were compared with the model’s internal cross-validated performance in datA (CV-RMSE = 0.6975; CV-R² = 0.2068). Model generalizability was further assessed using observed-versus-predicted calibration plots and quintile-based calibration summaries. According to our prespecified decision rule, the model was considered to generalize well if the external RMSE did not exceed 110% of the internal CV-RMSE and the external R² was at least 90% of the internal CV-R². Finally, we compared the distribution of log(PFS) between datA and datB to provide context for any observed loss of transportability.
+
+```{r}
+library(tidyverse)   
+library(caret)       
+library(glmnet)      
+library(mgcv)       
+library(earth)     
+library(corrplot)    
+library(knitr)       
+library(kableExtra)  
+library(vip)       
+library(car)
+set.seed(1)
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  savePredictions = TRUE
+)
+```
+
+```{r}
+load("datA.RData")
+load("datB.RData")
+```
+
+```{r}
+datA <- datA |>
+  mutate(
+    menopause        = factor(menopause, levels = c(0, 1), labels = c("Pre", "Post")),
+    race             = factor(race, levels = c(1, 2, 3, 4),
+                              labels = c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade      = factor(tumor_grade, levels = c(1, 2, 3),
+                              labels = c("Well", "Moderate", "Poor")),
+    stage            = factor(stage, levels = c(1, 2, 3), labels = c("I", "II", "III")),
+    ER               = factor(ER, levels = c(0, 1), labels = c("Neg", "Pos")),
+    PR               = factor(PR, levels = c(0, 1), labels = c("Neg", "Pos")),
+    HER2             = factor(HER2, levels = c(0, 1), labels = c("Neg", "Pos")),
+    surgery          = factor(surgery, levels = c(0, 1), labels = c("BCS", "Mastectomy")),
+    chemo            = factor(chemo, levels = c(0, 1), labels = c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, levels = c(0, 1), labels = c("No", "Yes"))
+  ) |>
+  select(-id)
+
+datB <- datB |>
+  mutate(
+    menopause        = factor(menopause, levels = c(0, 1), labels = c("Pre", "Post")),
+    race             = factor(race, levels = c(1, 2, 3, 4),
+                              labels = c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade      = factor(tumor_grade, levels = c(1, 2, 3),
+                              labels = c("Well", "Moderate", "Poor")),
+    stage            = factor(stage, levels = c(1, 2, 3), labels = c("I", "II", "III")),
+    ER               = factor(ER, levels = c(0, 1), labels = c("Neg", "Pos")),
+    PR               = factor(PR, levels = c(0, 1), labels = c("Neg", "Pos")),
+    HER2             = factor(HER2, levels = c(0, 1), labels = c("Neg", "Pos")),
+    surgery          = factor(surgery, levels = c(0, 1), labels = c("BCS", "Mastectomy")),
+    chemo            = factor(chemo, levels = c(0, 1), labels = c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, levels = c(0, 1), labels = c("No", "Yes"))
+  ) |>
+  select(-id)
+
+```
+
+```{r}
+# Refit model A exactly as in analysis
+set.seed(1)
+
+fit_gam <- mgcv::gam(
+  log_PFS ~ s(age) + s(bmi) + s(tumor_size) + s(lymph_nodes) + s(Ki67) +
+    menopause + race + tumor_grade + stage +
+    ER + PR + HER2 + surgery + chemo + hormonal_therapy,
+  data   = datA,
+  method = "REML"
+)
+
+```
+
+```{r}
+gam_cv_rmse <- 0.6975
+gam_cv_r2   <- 0.2068
+```
+
+```{r}
+# Predict datB using model A
+pred_B_from_A <- predict(fit_gam, newdata = datB)
+```
+
+```{r}
+# External validation metrics
+ext_rmse <- sqrt(mean((datB$log_PFS - pred_B_from_A)^2))
+ext_mae  <- mean(abs(datB$log_PFS - pred_B_from_A))
+ext_r2   <- cor(datB$log_PFS, pred_B_from_A)^2
+ext_bias <- mean(datB$log_PFS - pred_B_from_A)
+
+data.frame(
+  Metric = c("External RMSE", "External MAE", "External R2", "Mean prediction bias"),
+  Value  = round(c(ext_rmse, ext_mae, ext_r2, ext_bias), 4)
+) |>
+  kable(caption = "Table 1. External validation performance of model A in datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 10)
+```
+```{r}
+# Compare internal vs external performance
+data.frame(
+  Setting = c("Internal CV on datA", "External validation on datB"),
+  RMSE    = round(c(gam_cv_rmse, ext_rmse), 4),
+  R2      = round(c(gam_cv_r2,   ext_r2),   4)
+) |>
+  kable(caption = "Table 2. Internal performance in datA versus external performance in datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 10)
+```
+
+```{r}
+# Observed vs predicted
+data.frame(
+  observed  = datB$log_PFS,
+  predicted = pred_B_from_A
+) |>
+  ggplot(aes(x = predicted, y = observed)) +
+  geom_point(alpha = 0.25, color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    title = "External validation on datB",
+    x = "Predicted log(PFS) from model A",
+    y = "Observed log(PFS) in datB"
+  ) +
+  theme_bw()
+```
+
+```{r}
+# Calibration by quintiles
+val_datB <- datB |>
+  mutate(
+    pred_A = pred_B_from_A,
+    q_pred = ntile(pred_A, 5)
+  )
+
+calib_tab <- val_datB |>
+  group_by(q_pred) |>
+  summarise(
+    mean_pred = mean(pred_A),
+    mean_obs  = mean(log_PFS),
+    n         = n(),
+    .groups   = "drop"
+  )
+
+calib_tab |>
+  mutate(across(c(mean_pred, mean_obs), ~round(.x, 4))) |>
+  kable(caption = "Table 3. Calibration summary across quintiles of predicted values in datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 10)
+
+ggplot(calib_tab, aes(x = mean_pred, y = mean_obs)) +
+  geom_point(size = 2.5, color = "steelblue") +
+  geom_line(color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Calibration plot in datB",
+    x = "Mean predicted log(PFS)",
+    y = "Mean observed log(PFS)"
+  ) +
+  theme_bw()
+```
+```{r}
+# Generalizability decision
+generalize_flag <- ifelse(
+  ext_rmse <= gam_cv_rmse * 1.10 & ext_r2 >= gam_cv_r2 * 0.90,
+  "Yes", "No"
+)
+
+data.frame(
+  Criterion = c(
+    "External RMSE <= 110% of internal CV-RMSE",
+    "External R2 >= 90% of internal CV-R2",
+    "Overall conclusion"
+  ),
+  Result = c(
+    ifelse(ext_rmse <= gam_cv_rmse * 1.10, "Pass", "Fail"),
+    ifelse(ext_r2   >= gam_cv_r2   * 0.90, "Pass", "Fail"),
+    generalize_flag
+  )
+) |>
+  kable(caption = "Table 4. Generalizability assessment of model A in datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 10)
+```
+
+```{r}
+cat("Internal CV-RMSE on datA:", round(gam_cv_rmse, 4), "\n")
+cat("External RMSE on datB:   ", round(ext_rmse, 4), "\n")
+cat("Internal CV-R2 on datA:  ", round(gam_cv_r2, 4), "\n")
+cat("External R2 on datB:     ", round(ext_r2, 4), "\n")
+cat("Mean prediction bias:    ", round(ext_bias, 4), "\n")
+cat("Generalize well?         ", generalize_flag, "\n")
+```
+Result：
+
+When the final GAM trained on datA was applied to datB, its external validation performance was worse than its internal performance in the original cohort. In datB, the external RMSE was 0.8436, the external MAE was 0.6862, and the external R² was 0.1617. The mean prediction bias was 0.5003, indicating that the observed log(PFS) values in datB were, on average, higher than those predicted by the model developed from datA.
+
+Compared with the internal benchmark from datA, predictive performance deteriorated after transport to datB. The GAM had an internal CV-RMSE of 0.6975 and a CV-R² of 0.2068 in datA, whereas the corresponding external validation values in datB were 0.8436 and 0.1617, respectively. According to the predefined decision rule, the model failed both criteria: the external RMSE exceeded 110% of the internal CV-RMSE, and the external R² was below 90% of the internal CV-R². Therefore, the original model was judged not to generalize well to datB.
+
+This lack of generalizability was consistent with the substantial cohort shift observed between the two study periods. The mean log(PFS) increased from 2.196 in datA to 2.742 in datB, and this difference was highly significant (Welch two-sample t-test, p < 2.2 × 10^-16). Together with the positive prediction bias, these findings suggest that the earlier model systematically underpredicted progression-free survival in the later cohort, supporting the need for model updating or refitting in datB.
