@@ -1,0 +1,295 @@
+---
+title: "Model Refit in datB"
+author: "Meitong Zhou"
+date: "2026-03-27"
+output: html_document
+---
+Method
+
+To address the limited transportability of the original model, we repeated the full model training process in the 2000–2005 cohort (datB), while maintaining the same preprocessing procedures, candidate algorithms, and resampling strategy used in Part I. Specifically, datB was processed using the same factor coding and variable definitions as datA, and four candidate models were re-estimated: Ordinary Least Squares (OLS), Elastic Net, Multivariate Adaptive Regression Splines (MARS), and Generalized Additive Models (GAM). Model performance was assessed using repeated 10-fold cross-validation with 5 repeats, and the optimal model was selected based on cross-validated RMSE and R².
+
+For the refitted GAM, we retained the same structural specification as the final model originally developed in datA, including smooth terms for the continuous predictors age, BMI, tumor size, lymph nodes, and Ki67, together with linear terms for the categorical predictors. After identifying the best-performing model in datB, we compared its predictive performance with that of the transported GAM trained in datA. To examine how prediction changed across cohorts, we compared the parametric coefficients and the significance of the smooth terms between the datA and datB GAMs. We further visualized the partial effects of the continuous predictors in the refitted datB GAM to assess changes in the functional form of these associations.
+
+```{r}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(mgcv)
+library(earth)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(vip)
+library(car)
+
+set.seed(1)
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  savePredictions = TRUE
+)
+```
+```{r}
+load("datA.RData")
+load("datB.RData")
+```
+
+```{r}
+datA <- datA |>
+  mutate(
+    menopause        = factor(menopause, levels = c(0, 1), labels = c("Pre", "Post")),
+    race             = factor(race, levels = c(1, 2, 3, 4),
+                              labels = c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade      = factor(tumor_grade, levels = c(1, 2, 3),
+                              labels = c("Well", "Moderate", "Poor")),
+    stage            = factor(stage, levels = c(1, 2, 3), labels = c("I", "II", "III")),
+    ER               = factor(ER, levels = c(0, 1), labels = c("Neg", "Pos")),
+    PR               = factor(PR, levels = c(0, 1), labels = c("Neg", "Pos")),
+    HER2             = factor(HER2, levels = c(0, 1), labels = c("Neg", "Pos")),
+    surgery          = factor(surgery, levels = c(0, 1), labels = c("BCS", "Mastectomy")),
+    chemo            = factor(chemo, levels = c(0, 1), labels = c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, levels = c(0, 1), labels = c("No", "Yes"))
+  ) |>
+  select(-id)
+
+datB <- datB |>
+  mutate(
+    menopause        = factor(menopause, levels = c(0, 1), labels = c("Pre", "Post")),
+    race             = factor(race, levels = c(1, 2, 3, 4),
+                              labels = c("White", "Black", "Asian", "Hispanic")),
+    tumor_grade      = factor(tumor_grade, levels = c(1, 2, 3),
+                              labels = c("Well", "Moderate", "Poor")),
+    stage            = factor(stage, levels = c(1, 2, 3), labels = c("I", "II", "III")),
+    ER               = factor(ER, levels = c(0, 1), labels = c("Neg", "Pos")),
+    PR               = factor(PR, levels = c(0, 1), labels = c("Neg", "Pos")),
+    HER2             = factor(HER2, levels = c(0, 1), labels = c("Neg", "Pos")),
+    surgery          = factor(surgery, levels = c(0, 1), labels = c("BCS", "Mastectomy")),
+    chemo            = factor(chemo, levels = c(0, 1), labels = c("No", "Yes")),
+    hormonal_therapy = factor(hormonal_therapy, levels = c(0, 1), labels = c("No", "Yes"))
+  ) |>
+  select(-id)
+```
+
+```{r}
+# Refit model A exactly as in analysis
+set.seed(1)
+
+fit_gam <- mgcv::gam(
+  log_PFS ~ s(age) + s(bmi) + s(tumor_size) + s(lymph_nodes) + s(Ki67) +
+    menopause + race + tumor_grade + stage +
+    ER + PR + HER2 + surgery + chemo + hormonal_therapy,
+  data   = datA,
+  method = "REML"
+)
+
+```
+
+
+```{r}
+# transport DatA to B
+pred_B_from_A <- predict(fit_gam, newdata = datB)
+
+ext_rmse <- sqrt(mean((datB$log_PFS - pred_B_from_A)^2))
+ext_mae  <- mean(abs(datB$log_PFS - pred_B_from_A))
+ext_r2   <- cor(datB$log_PFS, pred_B_from_A)^2
+```
+
+
+```{r}
+# 1. OLS on datB
+set.seed(1)
+fit_lm_B <- train(
+  log_PFS ~ .,
+  data = datB,
+  method = "lm",
+  trControl = ctrl
+)
+
+ols_B_rmse <- min(fit_lm_B$results$RMSE)
+ols_B_r2   <- max(fit_lm_B$results$Rsquared)
+```
+
+
+```{r}
+# 2. Elastic Net on datB
+x_B <- model.matrix(log_PFS ~ ., datB)[, -1]
+y_B <- datB$log_PFS
+
+set.seed(1)
+fit_enet_B <- train(
+  x = x_B,
+  y = y_B,
+  method = "glmnet",
+  tuneLength = 20,
+  trControl = ctrl
+)
+
+enet_B_rmse <- min(fit_enet_B$results$RMSE)
+enet_B_r2   <- max(fit_enet_B$results$Rsquared)
+```
+
+
+```{r}
+# 3. MARS on datB
+set.seed(1)
+fit_mars_B <- train(
+  log_PFS ~ .,
+  data = datB,
+  method = "earth",
+  tuneLength = 20,
+  trControl = ctrl
+)
+
+mars_B_rmse <- min(fit_mars_B$results$RMSE)
+mars_B_r2   <- max(fit_mars_B$results$Rsquared)
+```
+
+
+```{r}
+# 4. GAM on datB
+set.seed(1)
+folds_B <- createFolds(datB$log_PFS, k = 10, list = TRUE, returnTrain = FALSE)
+
+gam_preds_B <- numeric(nrow(datB))
+
+for (i in seq_along(folds_B)) {
+  train_i <- datB[-folds_B[[i]], ]
+  test_i  <- datB[ folds_B[[i]], ]
+  
+  gam_i <- mgcv::gam(
+    log_PFS ~ s(age) + s(bmi) + s(tumor_size) + s(lymph_nodes) + s(Ki67) +
+      menopause + race + tumor_grade + stage +
+      ER + PR + HER2 + surgery + chemo + hormonal_therapy,
+    data   = train_i,
+    method = "REML"
+  )
+  
+  gam_preds_B[folds_B[[i]]] <- predict(gam_i, newdata = test_i)
+}
+
+gam_B_cv_rmse <- sqrt(mean((datB$log_PFS - gam_preds_B)^2))
+gam_B_cv_mae  <- mean(abs(datB$log_PFS - gam_preds_B))
+gam_B_cv_r2   <- cor(datB$log_PFS, gam_preds_B)^2
+
+## refit final GAM on full datB
+fit_gam_B <- mgcv::gam(
+  log_PFS ~ s(age) + s(bmi) + s(tumor_size) + s(lymph_nodes) + s(Ki67) +
+    menopause + race + tumor_grade + stage +
+    ER + PR + HER2 + surgery + chemo + hormonal_therapy,
+  data   = datB,
+  method = "REML"
+)
+
+summary(fit_gam_B)
+```
+
+```{r}
+# Model comparison in datB
+
+model_compare_B <- data.frame(
+  Model = c("OLS", "Elastic Net", "MARS", "GAM"),
+  CV_RMSE = c(ols_B_rmse, enet_B_rmse, mars_B_rmse, gam_B_cv_rmse),
+  CV_R2   = c(ols_B_r2,   enet_B_r2,   mars_B_r2,   gam_B_cv_r2)
+) |>
+  mutate(across(c(CV_RMSE, CV_R2), ~round(.x, 4))) |>
+  arrange(CV_RMSE)
+
+model_compare_B |>
+  kable(caption = "Table 9. Cross-validated model performance in datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 10)
+```
+```{r}
+# Compare transported datA GAM vs refitted datB model
+refit_compare <- data.frame(
+  Model = c("Transported GAM from datA", "Refitted GAM on datB"),
+  RMSE  = c(ext_rmse, gam_B_cv_rmse),
+  MAE   = c(ext_mae,  gam_B_cv_mae),
+  R2    = c(ext_r2,   gam_B_cv_r2)
+) |>
+  mutate(across(c(RMSE, MAE, R2), ~round(.x, 4)))
+
+refit_compare |>
+  kable(caption = "Table 10. Performance of transported versus refitted GAM in datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 10)
+```
+
+
+
+```{r}
+# Compare parametric coefficients
+coef_A <- summary(fit_gam)$p.table |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Term") |>
+  select(Term, Estimate = Estimate, P_value = `Pr(>|t|)`) |>
+  mutate(
+    Cohort = "datA",
+    Estimate = round(Estimate, 4),
+    P_value  = round(P_value, 4)
+  )
+
+coef_B <- summary(fit_gam_B)$p.table |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Term") |>
+  select(Term, Estimate = Estimate, P_value = `Pr(>|t|)`) |>
+  mutate(
+    Cohort = "datB",
+    Estimate = round(Estimate, 4),
+    P_value  = round(P_value, 4)
+  )
+
+bind_rows(coef_A, coef_B) |>
+  tidyr::pivot_wider(names_from = Cohort, values_from = c(Estimate, P_value)) |>
+  kable(caption = "Table 11. Comparison of parametric GAM coefficients between datA and datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+```{r}
+# Compare smooth terms
+smooth_A <- summary(fit_gam)$s.table |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Smooth_term") |>
+  select(Smooth_term, edf, P_value = `p-value`) |>
+  mutate(
+    Cohort = "datA",
+    edf    = round(edf, 3),
+    P_value = round(P_value, 4)
+  )
+
+smooth_B <- summary(fit_gam_B)$s.table |>
+  as.data.frame() |>
+  tibble::rownames_to_column("Smooth_term") |>
+  select(Smooth_term, edf, P_value = `p-value`) |>
+  mutate(
+    Cohort = "datB",
+    edf    = round(edf, 3),
+    P_value = round(P_value, 4)
+  )
+
+bind_rows(smooth_A, smooth_B) |>
+  tidyr::pivot_wider(names_from = Cohort, values_from = c(edf, P_value)) |>
+  kable(caption = "Table 12. Comparison of smooth terms between datA and datB.") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, font_size = 9)
+```
+
+
+```{r}
+par(mfrow = c(2, 3), mar = c(4, 4, 2, 1))
+plot(fit_gam_B, shade = TRUE, shade.col = "lightblue",
+     seWithMean = TRUE, scale = 0)
+par(mfrow = c(1, 1))
+```
+Result
+
+After repeating the model training process in datB, GAM again achieved the best predictive performance among the four candidate models. The refitted GAM had the lowest cross-validated RMSE (0.6693) and the highest cross-validated R² (0.1772), compared with Elastic Net (RMSE = 0.6726), MARS (RMSE = 0.6731, R² = 0.1707), and OLS (RMSE = 0.6735, R² = 0.1691). These results indicate that the nonlinear GAM framework remained the most appropriate modeling strategy in the later cohort.
+
+The refitted GAM in datB substantially outperformed the transported GAM from datA. When the original datA GAM was applied directly to datB, its performance was RMSE = 0.8436, MAE = 0.6862, and R² = 0.1617. After refitting the GAM in datB, performance improved to CV-RMSE = 0.6693, CV-MAE = 0.5337, and CV-R² = 0.1772. Thus, although GAM remained the best model class in both cohorts, the prediction relationship was not stable enough for the original model to be directly transported without updating.
+
+Inspection of the refitted datB GAM further suggested that the roles of several predictors changed over time. In datB, Hispanic race, ER positivity, and hormonal therapy were positively associated with log(PFS), with hormonal therapy showing the strongest linear association among the categorical predictors. For the smooth terms, BMI, tumor size, lymph nodes, and Ki67 remained significant, whereas age was no longer significant in datB. Compared with datA, this pattern suggests that the later cohort retained important nonlinear effects for several continuous predictors, but the relative importance and significance of specific predictors shifted.
+
+These findings show that the best modeling strategy did not change across cohorts, but the fitted prediction function did. Re-estimating the model in datB produced materially better predictive performance than transporting the earlier model unchanged.
